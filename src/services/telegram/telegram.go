@@ -4,6 +4,7 @@ import (
 	"book.transfer/src/config"
 	"database/sql"
 	"errors"
+	"fmt"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"io"
 	"log"
@@ -49,6 +50,23 @@ func NewTransferService() *TransferService {
 	return &TransferService{Bot: *bot, db: db, allowChatIds: allowChatIds, allowExtensions: allowExtensions}
 }
 
+func (s *TransferService) ListenForWebhook() {
+	updates := s.Bot.ListenForWebhook("/" + s.Bot.Token)
+
+	go http.ListenAndServe("0.0.0.0:3000", nil)
+
+	for update := range updates {
+		if !s.allowChatIds[update.Message.From.ID] {
+			continue
+		}
+		if update.Message.IsCommand() {
+			s.command(update.Message)
+		} else if update.Message.Document != nil {
+			s.document(update.Message)
+		}
+	}
+}
+
 func (s *TransferService) Observe() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 15
@@ -56,7 +74,7 @@ func (s *TransferService) Observe() {
 	updates := s.Bot.GetUpdatesChan(u)
 	for update := range updates {
 		if !s.allowChatIds[update.Message.From.ID] {
-
+			continue
 		}
 		if update.Message.IsCommand() {
 			s.command(update.Message)
@@ -125,11 +143,17 @@ func (s *TransferService) document(message *tgbotapi.Message) {
 			log.Fatal(err)
 			return
 		}
-		filename := filepath.Base(message.Document.FileName)
-		link := file.Link(s.Bot.Token)
 
 		path, _ := os.Getwd()
-		localFilepath := path + "/upload/" + filename
+		newFilename := message.Caption + ext
+		directory := fmt.Sprintf("%s/upload/%s/", path, message.Document.FileUniqueID)
+		if _, err := os.Stat(directory); errors.Is(err, os.ErrNotExist) {
+			if os.Mkdir(directory, os.ModePerm) != nil {
+				return
+			}
+		}
+
+		localFilepath := fmt.Sprintf("%s/%s", directory, newFilename)
 		if _, err := os.Stat(localFilepath); errors.Is(err, os.ErrNotExist) {
 			var (
 				out  *os.File
@@ -141,6 +165,7 @@ func (s *TransferService) document(message *tgbotapi.Message) {
 				log.Fatal(err)
 				return
 			}
+			link := file.Link(s.Bot.Token)
 			resp, err = http.Get(link)
 			if err != nil {
 				log.Fatal(err)
@@ -158,7 +183,6 @@ func (s *TransferService) document(message *tgbotapi.Message) {
 		if ext != ".epub" {
 			subject = "convert"
 		}
-		newFilename := message.Caption + ext
 		msg := tgbotapi.NewMessage(message.Chat.ID, "Файл '"+newFilename+"' успешно отправлен.")
 		msg.ReplyToMessageID = message.MessageID
 		if config.SendEmail(email, subject, "", map[string]string{newFilename: localFilepath}) != nil {

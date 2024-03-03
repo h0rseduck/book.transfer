@@ -16,5 +16,6 @@ func main() {
 	config.InitDB()
 
 	transferService := telegram.NewTransferService()
-	transferService.Observe()
+	transferService.ListenForWebhook()
+	//transferService.Observe()
 }
