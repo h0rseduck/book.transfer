@@ -14,5 +14,5 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    command: http 3000
+    command: 'http 3000'
     network_mode: "host"
