@@ -10,3 +10,11 @@ services:
     volumes:
       - .:/app
     restart: unless-stopped
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: http 3000
+    network_mode: "host"
