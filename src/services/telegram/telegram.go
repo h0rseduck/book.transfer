@@ -51,7 +51,7 @@ func NewTransferService() *TransferService {
 }
 
 func (s *TransferService) ListenForWebhook() {
-	updates := s.Bot.ListenForWebhook("/" + s.Bot.Token)
+	updates := s.Bot.ListenForWebhook("/" + os.Getenv("TELEGRAM_WEBHOOK"))
 
 	go http.ListenAndServe("0.0.0.0:3000", nil)
 
