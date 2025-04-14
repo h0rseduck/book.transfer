@@ -9,7 +9,7 @@ services:
       - ./database:/app/database
       - ./upload:/app/upload
     ports:
-      - "3000:3000"
+      - "3001:3000"
     restart: unless-stopped
 
   ngrok:
@@ -17,5 +17,5 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    command: http --domain=${DOMAIN} 3000
+    command: http --domain=${DOMAIN} 3001
     network_mode: "host"
