@@ -5,6 +5,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    volumes:
+      - ./database:/app/database
+      - ./upload:/app/upload
     ports:
       - "3000:3000"
     restart: unless-stopped
