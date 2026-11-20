@@ -39,7 +39,7 @@ func TestTransferReactionAdded(t *testing.T) {
 	otherReaction := models.ReactionType{
 		Type: models.ReactionTypeTypeEmoji,
 		ReactionTypeEmoji: &models.ReactionTypeEmoji{
-			Emoji: "👍",
+			Emoji: "👎",
 		},
 	}
 

@@ -20,7 +20,7 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
-const transferReactionEmoji = "📚"
+const transferReactionEmoji = "👍"
 
 type TransferService struct {
 	Bot             *telegrambot.Bot
@@ -137,6 +137,7 @@ func (s *TransferService) ListenForWebhook(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("configure Telegram webhook: %w", err)
 	}
+	log.Printf("Telegram webhook configured; updates=message,message_reaction")
 
 	botDone := make(chan struct{})
 	go func() {
@@ -278,6 +279,8 @@ func (s *TransferService) document(ctx context.Context, message *models.Message)
 	if err != nil {
 		log.Printf("send user document to email: %v", err)
 		text = "Не удалось отправить файл."
+	} else {
+		log.Printf("direct document transfer completed chat_id=%d message_id=%d user_id=%d", message.Chat.ID, message.ID, message.From.ID)
 	}
 	s.sendReply(ctx, message.Chat.ID, message.ID, text, "")
 }
@@ -309,6 +312,7 @@ func (s *TransferService) rememberBotDocument(ctx context.Context, message *mode
 		log.Printf("remember bot document %d/%d: %v", message.Chat.ID, message.ID, err)
 		return
 	}
+	log.Printf("bot document stored chat_id=%d message_id=%d source_bot_id=%d extension=%q", message.Chat.ID, message.ID, message.From.ID, strings.ToLower(filepath.Ext(message.Document.FileName)))
 
 	_, err = s.Bot.SetMessageReaction(ctx, &telegrambot.SetMessageReactionParams{
 		ChatID:    message.Chat.ID,
@@ -322,6 +326,8 @@ func (s *TransferService) rememberBotDocument(ctx context.Context, message *mode
 	})
 	if err != nil {
 		log.Printf("add %s reaction to bot document %d/%d: %v", transferReactionEmoji, message.Chat.ID, message.ID, err)
+	} else {
+		log.Printf("trigger reaction added chat_id=%d message_id=%d", message.Chat.ID, message.ID)
 	}
 }
 
@@ -332,9 +338,13 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 	if !transferReactionAdded(reaction.OldReaction, reaction.NewReaction) {
 		return
 	}
+	log.Printf("transfer reaction received chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
 
 	document, err := s.storedBotDocument(reaction.Chat.ID, reaction.MessageID)
 	if errors.Is(err, sql.ErrNoRows) {
+		log.Printf("reaction has no stored bot document chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
+		text := userLabel(reaction.User) + ": не могу отправить файл — исходное сообщение другого бота не было получено. Проверьте Bot-to-Bot Communication Mode, права администратора и Group Privacy."
+		s.sendReply(ctx, reaction.Chat.ID, reaction.MessageID, text, "")
 		return
 	}
 	if err != nil {
@@ -344,6 +354,7 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 
 	emailAddress, err := s.userEmail(reaction.User.ID)
 	if errors.Is(err, sql.ErrNoRows) {
+		log.Printf("reacting user has no registered email user_id=%d", reaction.User.ID)
 		text := userLabel(reaction.User) + ", сначала зарегистрируйте Email командой /email в личном чате с ботом."
 		s.sendReply(ctx, reaction.Chat.ID, reaction.MessageID, text, "")
 		return
@@ -359,8 +370,17 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 		return
 	}
 	if !claimed {
+		log.Printf("duplicate reaction transfer ignored chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
 		return
 	}
+	log.Printf("reaction transfer started chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
+	statusMessageID := s.sendReply(
+		ctx,
+		reaction.Chat.ID,
+		reaction.MessageID,
+		userLabel(reaction.User)+": ⏳ отправляю файл на зарегистрированный Email…",
+		"",
+	)
 
 	telegramDocument := &models.Document{
 		FileID:       document.FileID,
@@ -372,12 +392,13 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 		s.releaseTransfer(reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
 		log.Printf("send reacted document to email: %v", err)
 		text := userLabel(reaction.User) + ": не удалось отправить файл. Уберите и снова поставьте реакцию " + transferReactionEmoji + ", чтобы повторить."
-		s.sendReply(ctx, reaction.Chat.ID, reaction.MessageID, text, "")
+		s.updateStatus(ctx, reaction.Chat.ID, reaction.MessageID, statusMessageID, text)
 		return
 	}
 
-	text := userLabel(reaction.User) + ": файл '" + filename + "' успешно отправлен на зарегистрированный Email."
-	s.sendReply(ctx, reaction.Chat.ID, reaction.MessageID, text, "")
+	text := userLabel(reaction.User) + ": ✅ файл '" + filename + "' успешно отправлен на зарегистрированный Email."
+	s.updateStatus(ctx, reaction.Chat.ID, reaction.MessageID, statusMessageID, text)
+	log.Printf("reaction transfer completed chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
 }
 
 func transferReactionAdded(oldReactions, newReactions []models.ReactionType) bool {
@@ -536,8 +557,8 @@ func (s *TransferService) downloadFile(ctx context.Context, link, destination st
 	return nil
 }
 
-func (s *TransferService) sendReply(ctx context.Context, chatID int64, messageID int, text string, parseMode models.ParseMode) {
-	_, err := s.Bot.SendMessage(ctx, &telegrambot.SendMessageParams{
+func (s *TransferService) sendReply(ctx context.Context, chatID int64, messageID int, text string, parseMode models.ParseMode) int {
+	message, err := s.Bot.SendMessage(ctx, &telegrambot.SendMessageParams{
 		ChatID:    chatID,
 		Text:      text,
 		ParseMode: parseMode,
@@ -548,7 +569,24 @@ func (s *TransferService) sendReply(ctx context.Context, chatID int64, messageID
 	})
 	if err != nil {
 		log.Printf("send Telegram reply: %v", err)
+		return 0
 	}
+	return message.ID
+}
+
+func (s *TransferService) updateStatus(ctx context.Context, chatID int64, replyToMessageID, statusMessageID int, text string) {
+	if statusMessageID != 0 {
+		if _, err := s.Bot.EditMessageText(ctx, &telegrambot.EditMessageTextParams{
+			ChatID:    chatID,
+			MessageID: statusMessageID,
+			Text:      text,
+		}); err == nil {
+			return
+		} else {
+			log.Printf("edit Telegram transfer status: %v", err)
+		}
+	}
+	s.sendReply(ctx, chatID, replyToMessageID, text, "")
 }
 
 func userLabel(user *models.User) string {
