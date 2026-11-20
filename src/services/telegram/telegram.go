@@ -2,10 +2,10 @@ package telegram
 
 import (
 	"book.transfer/src/config"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"io"
 	"log"
 	"net/http"
@@ -14,182 +14,544 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
+	telegrambot "github.com/go-telegram/bot"
+	"github.com/go-telegram/bot/models"
 )
 
+const transferReactionEmoji = "📚"
+
 type TransferService struct {
-	Bot             tgbotapi.BotAPI
+	Bot             *telegrambot.Bot
 	db              *sql.DB
-	allowChatIds    map[int64]bool
+	allowUserIDs    map[int64]bool
 	allowExtensions map[string]bool
+	downloadClient  *http.Client
 }
 
-func NewTransferService() *TransferService {
-	bot, err := tgbotapi.NewBotAPI(os.Getenv("TELEGRAM_TOKEN"))
-	if err != nil {
-		log.Fatal(err)
-	}
-	//bot.Debug = true
+type storedDocument struct {
+	FileID       string
+	FileUniqueID string
+	FileName     string
+	Caption      string
+}
 
-	var (
-		allowChatIds    = map[int64]bool{}
-		allowExtensions = map[string]bool{}
-		i               int64
+func NewTransferService() (*TransferService, error) {
+	service := &TransferService{
+		db:              config.GetDB(),
+		allowUserIDs:    parseAllowedUserIDs(os.Getenv("ALLOW_IDS")),
+		allowExtensions: parseAllowedExtensions(os.Getenv("ALLOW_EXTENSION")),
+		downloadClient:  &http.Client{Timeout: 2 * time.Minute},
+	}
+
+	bot, err := telegrambot.New(
+		os.Getenv("TELEGRAM_TOKEN"),
+		telegrambot.WithDefaultHandler(service.handleUpdate),
+		telegrambot.WithNotAsyncHandlers(),
+		telegrambot.WithErrorsHandler(func(err error) {
+			log.Printf("telegram update error: %v", err)
+		}),
 	)
-	for _, id := range strings.Split(os.Getenv("ALLOW_IDS"), ";") {
-		i, err = strconv.ParseInt(id, 10, 64)
-		if err != nil {
-			continue
-		}
-		allowChatIds[i] = true
-	}
-	for _, ext := range strings.Split(os.Getenv("ALLOW_EXTENSION"), ";") {
-		allowExtensions[ext] = true
-	}
-
-	db := config.GetDB()
-	return &TransferService{Bot: *bot, db: db, allowChatIds: allowChatIds, allowExtensions: allowExtensions}
-}
-
-func (s *TransferService) ListenForWebhook() {
-	updates := s.Bot.ListenForWebhook("/" + os.Getenv("TELEGRAM_WEBHOOK"))
-
-	go http.ListenAndServe("0.0.0.0:3000", nil)
-
-	for update := range updates {
-		if !s.allowChatIds[update.Message.From.ID] {
-			continue
-		}
-		if update.Message.IsCommand() {
-			s.command(update.Message)
-		} else if update.Message.Document != nil {
-			s.document(update.Message)
-		}
-	}
-}
-
-func (s *TransferService) Observe() {
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 15
-
-	updates := s.Bot.GetUpdatesChan(u)
-	for update := range updates {
-		if !s.allowChatIds[update.Message.From.ID] {
-			continue
-		}
-		if update.Message.IsCommand() {
-			s.command(update.Message)
-		} else if update.Message.Document != nil {
-			s.document(update.Message)
-		}
-	}
-}
-
-func (s *TransferService) command(message *tgbotapi.Message) {
-	msg := tgbotapi.NewMessage(message.Chat.ID, "")
-	msg.ParseMode = "html"
-	switch message.Command() {
-	case "start":
-		msg.Text = "Пожалуйста используйте команду /email для того чтобы установить Email для отправки файлов."
-	case "email":
-		email := strings.Trim(message.Text[6:len(message.Text)], " ")
-		_, err := mail.ParseAddress(email)
-		if err == nil {
-			stmt, err := s.db.Prepare("INSERT INTO user('id', 'email') VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET email=excluded.email;")
-			if err != nil {
-				log.Fatal(err)
-				return
-			}
-			defer stmt.Close()
-			_, err = stmt.Exec(message.From.ID, email)
-			if err == nil {
-				msg.Text = "Ваш Email установлен. \n\nПримечание: для Kindle необходимо указать email бота book.transfer.bot@gmail.com в качестве разрешенного в разделе: <b>Manage Your Content & Devices > Preferences > Personal Document Settings</b>"
-			} else {
-				msg.Text = "Не удалось установть Email."
-			}
-		} else {
-			msg.Text = "Значение «" + email + "» не является правильным email адресом."
-		}
-	}
-	if msg.Text != "" {
-		if _, err := s.Bot.Send(msg); err != nil {
-			log.Fatal(err)
-		}
-	}
-}
-
-func (s *TransferService) document(message *tgbotapi.Message) {
-	var email string
-	err := s.db.QueryRow("SELECT email FROM user WHERE id = ? LIMIT 1;", message.From.ID).Scan(&email)
 	if err != nil {
-		msg := tgbotapi.NewMessage(message.Chat.ID, "У вас не установлен Email. Пожалуйста используйте команду /email и повторите попытку.")
-		if _, err := s.Bot.Send(msg); err != nil {
-			log.Fatal(err)
-		}
-	} else {
-		ext := strings.ToLower(filepath.Ext(message.Document.FileName))
-		if !s.allowExtensions[ext] {
-			extensions := strings.Join(strings.Split(os.Getenv("ALLOW_EXTENSION"), ";"), ", ")
-			msg := tgbotapi.NewMessage(message.Chat.ID, "Файл содержит не поддерживаемый формат. \nРазрешенные форматы: <b>"+extensions+"</b>")
-			msg.ParseMode = "html"
-			msg.ReplyToMessageID = message.MessageID
-			if _, err := s.Bot.Send(msg); err != nil {
-				log.Fatal(err)
-			}
-			return
-		}
+		return nil, fmt.Errorf("create Telegram bot: %w", err)
+	}
 
-		file, err := s.Bot.GetFile(tgbotapi.FileConfig{FileID: message.Document.FileID})
-		if err != nil {
-			log.Fatal(err)
-			return
-		}
+	service.Bot = bot
+	return service, nil
+}
 
-		path, _ := os.Getwd()
-		newFilename := message.Caption + ext
-		directory := fmt.Sprintf("%s/upload/%s/", path, message.Document.FileUniqueID)
-		if _, err := os.Stat(directory); errors.Is(err, os.ErrNotExist) {
-			if os.Mkdir(directory, os.ModePerm) != nil {
-				return
-			}
-		}
-
-		localFilepath := fmt.Sprintf("%s/%s", directory, newFilename)
-		if _, err := os.Stat(localFilepath); errors.Is(err, os.ErrNotExist) {
-			var (
-				out  *os.File
-				resp *http.Response
-			)
-			out, err = os.Create(localFilepath)
-			defer out.Close()
-			if err != nil {
-				log.Fatal(err)
-				return
-			}
-			link := file.Link(s.Bot.Token)
-			resp, err = http.Get(link)
-			if err != nil {
-				log.Fatal(err)
-				return
-			}
-			defer resp.Body.Close()
-			_, err = io.Copy(out, resp.Body)
-			if err != nil {
-				log.Fatal(err)
-				return
-			}
-		}
-
-		subject := ""
-		if ext != ".epub" {
-			subject = "convert"
-		}
-		msg := tgbotapi.NewMessage(message.Chat.ID, "Файл '"+newFilename+"' успешно отправлен.")
-		msg.ReplyToMessageID = message.MessageID
-		if config.SendEmail(email, subject, "", map[string]string{newFilename: localFilepath}) != nil {
-			msg.Text = "Не удалось отправить файл."
-		}
-		if _, err := s.Bot.Send(msg); err != nil {
-			log.Fatal(err)
+func parseAllowedUserIDs(raw string) map[int64]bool {
+	result := make(map[int64]bool)
+	for _, value := range strings.Split(raw, ";") {
+		id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err == nil {
+			result[id] = true
 		}
 	}
+	return result
+}
+
+func parseAllowedExtensions(raw string) map[string]bool {
+	result := make(map[string]bool)
+	for _, value := range strings.Split(raw, ";") {
+		extension := strings.ToLower(strings.TrimSpace(value))
+		if extension != "" {
+			result[extension] = true
+		}
+	}
+	return result
+}
+
+func (s *TransferService) ListenForWebhook(ctx context.Context) error {
+	webhookPath := "/" + strings.TrimLeft(strings.TrimSpace(os.Getenv("TELEGRAM_WEBHOOK")), "/")
+	if webhookPath == "/" {
+		return errors.New("TELEGRAM_WEBHOOK is empty")
+	}
+
+	webhookURL := strings.TrimRight(strings.TrimSpace(os.Getenv("DOMAIN")), "/")
+	if webhookURL == "" {
+		return errors.New("DOMAIN is empty")
+	}
+	if !strings.HasPrefix(webhookURL, "https://") && !strings.HasPrefix(webhookURL, "http://") {
+		webhookURL = "https://" + webhookURL
+	}
+	webhookURL += webhookPath
+
+	mux := http.NewServeMux()
+	mux.Handle(webhookPath, s.Bot.WebhookHandler())
+	server := &http.Server{
+		Addr:              "0.0.0.0:3000",
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	serverErrors := make(chan error, 1)
+	go func() {
+		err := server.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrors <- err
+			return
+		}
+		serverErrors <- nil
+	}()
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown webhook server: %v", err)
+		}
+	}()
+
+	go s.pruneServiceData(ctx)
+
+	_, err := s.Bot.SetWebhook(ctx, &telegrambot.SetWebhookParams{
+		URL: webhookURL,
+		AllowedUpdates: []string{
+			models.AllowedUpdateMessage,
+			models.AllowedUpdateMessageReaction,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("configure Telegram webhook: %w", err)
+	}
+
+	botDone := make(chan struct{})
+	go func() {
+		s.Bot.StartWebhook(ctx)
+		close(botDone)
+	}()
+
+	select {
+	case err := <-serverErrors:
+		return err
+	case <-botDone:
+		return nil
+	}
+}
+
+func (s *TransferService) pruneServiceData(ctx context.Context) {
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := config.PruneServiceData(time.Now().Add(-config.ServiceDataRetention)); err != nil {
+				log.Printf("prune Telegram service data: %v", err)
+			}
+		}
+	}
+}
+
+func (s *TransferService) handleUpdate(ctx context.Context, _ *telegrambot.Bot, update *models.Update) {
+	if update == nil {
+		return
+	}
+	if update.MessageReaction != nil {
+		s.handleReaction(ctx, update.MessageReaction)
+		return
+	}
+	if update.Message != nil {
+		s.handleMessage(ctx, update.Message)
+	}
+}
+
+func (s *TransferService) handleMessage(ctx context.Context, message *models.Message) {
+	if message.From == nil {
+		return
+	}
+
+	if message.From.IsBot {
+		if message.From.ID != s.Bot.ID() && message.Document != nil {
+			s.rememberBotDocument(ctx, message)
+		}
+		return
+	}
+
+	if !s.allowUserIDs[message.From.ID] {
+		return
+	}
+
+	command, arguments := parseCommand(message.Text)
+	if command != "" {
+		s.command(ctx, message, command, arguments)
+		return
+	}
+	if message.Document != nil {
+		s.document(ctx, message)
+	}
+}
+
+func parseCommand(text string) (string, string) {
+	fields := strings.Fields(text)
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "/") {
+		return "", ""
+	}
+
+	command := strings.TrimPrefix(fields[0], "/")
+	if at := strings.Index(command, "@"); at >= 0 {
+		command = command[:at]
+	}
+	arguments := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
+	return strings.ToLower(command), arguments
+}
+
+func (s *TransferService) command(ctx context.Context, message *models.Message, command, arguments string) {
+	text := ""
+	parseMode := models.ParseMode("")
+
+	switch command {
+	case "start":
+		text = "Пожалуйста используйте команду /email для того чтобы установить Email для отправки файлов."
+	case "email":
+		emailAddress := strings.TrimSpace(arguments)
+		if _, err := mail.ParseAddress(emailAddress); err != nil {
+			text = "Значение «" + emailAddress + "» не является правильным email адресом."
+			break
+		}
+
+		_, err := s.db.Exec(
+			"INSERT INTO user('id', 'email') VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET email=excluded.email;",
+			message.From.ID,
+			emailAddress,
+		)
+		if err != nil {
+			log.Printf("save email for user %d: %v", message.From.ID, err)
+			text = "Не удалось установить Email."
+			break
+		}
+
+		text = "Ваш Email установлен. \n\nПримечание: для Kindle необходимо указать email бота book.transfer.bot@gmail.com в качестве разрешенного в разделе: <b>Manage Your Content & Devices > Preferences > Personal Document Settings</b>"
+		parseMode = models.ParseModeHTML
+	}
+
+	if text != "" {
+		s.sendReply(ctx, message.Chat.ID, message.ID, text, parseMode)
+	}
+}
+
+func (s *TransferService) document(ctx context.Context, message *models.Message) {
+	emailAddress, err := s.userEmail(message.From.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		s.sendReply(ctx, message.Chat.ID, message.ID, "У вас не установлен Email. Пожалуйста используйте команду /email и повторите попытку.", "")
+		return
+	}
+	if err != nil {
+		log.Printf("load email for user %d: %v", message.From.ID, err)
+		return
+	}
+
+	if !s.isAllowedDocument(message.Document) {
+		extensions := strings.Join(strings.Split(os.Getenv("ALLOW_EXTENSION"), ";"), ", ")
+		text := "Файл содержит не поддерживаемый формат. \nРазрешенные форматы: <b>" + extensions + "</b>"
+		s.sendReply(ctx, message.Chat.ID, message.ID, text, models.ParseModeHTML)
+		return
+	}
+
+	filename, err := s.sendDocumentToEmail(ctx, message.Document, message.Caption, emailAddress)
+	text := "Файл '" + filename + "' успешно отправлен."
+	if err != nil {
+		log.Printf("send user document to email: %v", err)
+		text = "Не удалось отправить файл."
+	}
+	s.sendReply(ctx, message.Chat.ID, message.ID, text, "")
+}
+
+func (s *TransferService) rememberBotDocument(ctx context.Context, message *models.Message) {
+	if !s.isAllowedDocument(message.Document) {
+		return
+	}
+
+	_, err := s.db.Exec(
+		`INSERT INTO bot_document(chat_id, message_id, file_id, file_unique_id, file_name, caption, source_bot_id)
+		 VALUES(?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(chat_id, message_id) DO UPDATE SET
+			file_id=excluded.file_id,
+			file_unique_id=excluded.file_unique_id,
+			file_name=excluded.file_name,
+			caption=excluded.caption,
+			source_bot_id=excluded.source_bot_id,
+			created_at=strftime('%s', 'now')`,
+		message.Chat.ID,
+		message.ID,
+		message.Document.FileID,
+		message.Document.FileUniqueID,
+		message.Document.FileName,
+		message.Caption,
+		message.From.ID,
+	)
+	if err != nil {
+		log.Printf("remember bot document %d/%d: %v", message.Chat.ID, message.ID, err)
+		return
+	}
+
+	_, err = s.Bot.SetMessageReaction(ctx, &telegrambot.SetMessageReactionParams{
+		ChatID:    message.Chat.ID,
+		MessageID: message.ID,
+		Reaction: []models.ReactionType{{
+			Type: models.ReactionTypeTypeEmoji,
+			ReactionTypeEmoji: &models.ReactionTypeEmoji{
+				Emoji: transferReactionEmoji,
+			},
+		}},
+	})
+	if err != nil {
+		log.Printf("add %s reaction to bot document %d/%d: %v", transferReactionEmoji, message.Chat.ID, message.ID, err)
+	}
+}
+
+func (s *TransferService) handleReaction(ctx context.Context, reaction *models.MessageReactionUpdated) {
+	if reaction.User == nil || reaction.User.IsBot || !s.allowUserIDs[reaction.User.ID] {
+		return
+	}
+	if !transferReactionAdded(reaction.OldReaction, reaction.NewReaction) {
+		return
+	}
+
+	document, err := s.storedBotDocument(reaction.Chat.ID, reaction.MessageID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return
+	}
+	if err != nil {
+		log.Printf("load bot document %d/%d: %v", reaction.Chat.ID, reaction.MessageID, err)
+		return
+	}
+
+	emailAddress, err := s.userEmail(reaction.User.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		text := userLabel(reaction.User) + ", сначала зарегистрируйте Email командой /email в личном чате с ботом."
+		s.sendReply(ctx, reaction.Chat.ID, reaction.MessageID, text, "")
+		return
+	}
+	if err != nil {
+		log.Printf("load email for reacting user %d: %v", reaction.User.ID, err)
+		return
+	}
+
+	claimed, err := s.claimTransfer(reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
+	if err != nil {
+		log.Printf("claim document transfer: %v", err)
+		return
+	}
+	if !claimed {
+		return
+	}
+
+	telegramDocument := &models.Document{
+		FileID:       document.FileID,
+		FileUniqueID: document.FileUniqueID,
+		FileName:     document.FileName,
+	}
+	filename, err := s.sendDocumentToEmail(ctx, telegramDocument, document.Caption, emailAddress)
+	if err != nil {
+		s.releaseTransfer(reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
+		log.Printf("send reacted document to email: %v", err)
+		text := userLabel(reaction.User) + ": не удалось отправить файл. Уберите и снова поставьте реакцию " + transferReactionEmoji + ", чтобы повторить."
+		s.sendReply(ctx, reaction.Chat.ID, reaction.MessageID, text, "")
+		return
+	}
+
+	text := userLabel(reaction.User) + ": файл '" + filename + "' успешно отправлен на зарегистрированный Email."
+	s.sendReply(ctx, reaction.Chat.ID, reaction.MessageID, text, "")
+}
+
+func transferReactionAdded(oldReactions, newReactions []models.ReactionType) bool {
+	return !containsReaction(oldReactions, transferReactionEmoji) && containsReaction(newReactions, transferReactionEmoji)
+}
+
+func containsReaction(reactions []models.ReactionType, emoji string) bool {
+	for _, reaction := range reactions {
+		if reaction.Type == models.ReactionTypeTypeEmoji &&
+			reaction.ReactionTypeEmoji != nil &&
+			reaction.ReactionTypeEmoji.Emoji == emoji {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *TransferService) isAllowedDocument(document *models.Document) bool {
+	if document == nil {
+		return false
+	}
+	extension := strings.ToLower(filepath.Ext(document.FileName))
+	return s.allowExtensions[extension]
+}
+
+func (s *TransferService) userEmail(userID int64) (string, error) {
+	var emailAddress string
+	err := s.db.QueryRow("SELECT email FROM user WHERE id = ? LIMIT 1", userID).Scan(&emailAddress)
+	return emailAddress, err
+}
+
+func (s *TransferService) storedBotDocument(chatID int64, messageID int) (storedDocument, error) {
+	document := storedDocument{}
+	err := s.db.QueryRow(
+		`SELECT file_id, file_unique_id, file_name, caption
+		 FROM bot_document
+		 WHERE chat_id = ? AND message_id = ?
+		 LIMIT 1`,
+		chatID,
+		messageID,
+	).Scan(&document.FileID, &document.FileUniqueID, &document.FileName, &document.Caption)
+	return document, err
+}
+
+func (s *TransferService) claimTransfer(chatID int64, messageID int, userID int64) (bool, error) {
+	result, err := s.db.Exec(
+		"INSERT OR IGNORE INTO document_transfer(chat_id, message_id, user_id) VALUES(?, ?, ?)",
+		chatID,
+		messageID,
+		userID,
+	)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
+}
+
+func (s *TransferService) releaseTransfer(chatID int64, messageID int, userID int64) {
+	if _, err := s.db.Exec(
+		"DELETE FROM document_transfer WHERE chat_id = ? AND message_id = ? AND user_id = ?",
+		chatID,
+		messageID,
+		userID,
+	); err != nil {
+		log.Printf("release document transfer: %v", err)
+	}
+}
+
+func (s *TransferService) sendDocumentToEmail(ctx context.Context, document *models.Document, caption, emailAddress string) (string, error) {
+	file, err := s.Bot.GetFile(ctx, &telegrambot.GetFileParams{FileID: document.FileID})
+	if err != nil {
+		return "", fmt.Errorf("get Telegram file: %w", err)
+	}
+
+	filename := documentFilename(document, caption)
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		return filename, fmt.Errorf("get working directory: %w", err)
+	}
+	directory := filepath.Join(workingDirectory, "upload", document.FileUniqueID)
+	if err := os.MkdirAll(directory, os.ModePerm); err != nil {
+		return filename, fmt.Errorf("create upload directory: %w", err)
+	}
+
+	localFilepath := filepath.Join(directory, filename)
+	if _, err := os.Stat(localFilepath); errors.Is(err, os.ErrNotExist) {
+		if err := s.downloadFile(ctx, s.Bot.FileDownloadLink(file), localFilepath); err != nil {
+			return filename, err
+		}
+	} else if err != nil {
+		return filename, fmt.Errorf("inspect downloaded file: %w", err)
+	}
+
+	subject := ""
+	if strings.ToLower(filepath.Ext(document.FileName)) != ".epub" {
+		subject = "convert"
+	}
+	if err := config.SendEmail(emailAddress, subject, "", map[string]string{filename: localFilepath}); err != nil {
+		return filename, fmt.Errorf("send email: %w", err)
+	}
+	return filename, nil
+}
+
+func documentFilename(document *models.Document, caption string) string {
+	extension := strings.ToLower(filepath.Ext(document.FileName))
+	base := strings.TrimSpace(caption)
+	if base == "" {
+		filename := filepath.Base(document.FileName)
+		if filename != "." && filename != "" {
+			return filename
+		}
+		base = document.FileUniqueID
+	}
+	return filepath.Base(base) + extension
+}
+
+func (s *TransferService) downloadFile(ctx context.Context, link, destination string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
+	if err != nil {
+		return fmt.Errorf("create file request: %w", err)
+	}
+	response, err := s.downloadClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("download Telegram file: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("download Telegram file: unexpected HTTP status %s", response.Status)
+	}
+
+	temporaryFile, err := os.CreateTemp(filepath.Dir(destination), ".telegram-download-*")
+	if err != nil {
+		return fmt.Errorf("create local file: %w", err)
+	}
+	temporaryPath := temporaryFile.Name()
+	_, copyErr := io.Copy(temporaryFile, response.Body)
+	closeErr := temporaryFile.Close()
+	if copyErr != nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("save Telegram file: %w", copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("close Telegram file: %w", closeErr)
+	}
+	if err := os.Rename(temporaryPath, destination); err != nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("finish Telegram file download: %w", err)
+	}
+	return nil
+}
+
+func (s *TransferService) sendReply(ctx context.Context, chatID int64, messageID int, text string, parseMode models.ParseMode) {
+	_, err := s.Bot.SendMessage(ctx, &telegrambot.SendMessageParams{
+		ChatID:    chatID,
+		Text:      text,
+		ParseMode: parseMode,
+		ReplyParameters: &models.ReplyParameters{
+			MessageID:                messageID,
+			AllowSendingWithoutReply: true,
+		},
+	})
+	if err != nil {
+		log.Printf("send Telegram reply: %v", err)
+	}
+}
+
+func userLabel(user *models.User) string {
+	if user.Username != "" {
+		return "@" + user.Username
+	}
+	if user.FirstName != "" {
+		return user.FirstName
+	}
+	return strconv.FormatInt(user.ID, 10)
 }
