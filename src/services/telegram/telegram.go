@@ -23,8 +23,8 @@ import (
 const (
 	transferReactionEmoji   = "👍"
 	processingReactionEmoji = "👀"
-	successReactionEmoji    = "✅"
-	failureReactionEmoji    = "❌"
+	successReactionEmoji    = "🎉"
+	failureReactionEmoji    = "👎"
 )
 
 type TransferService struct {
@@ -361,7 +361,7 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 		return
 	}
 
-	claimed, err := s.claimTransfer(reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
+	claimed, err := s.claimTransfer(reaction.Chat.ID, reaction.MessageID, reaction.User.ID, document.FileUniqueID)
 	if err != nil {
 		log.Printf("claim document transfer: %v", err)
 		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
@@ -370,6 +370,7 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 	}
 	if !claimed {
 		log.Printf("duplicate reaction transfer ignored chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
+		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, successReactionEmoji)
 		return
 	}
 	log.Printf("reaction transfer started chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
@@ -464,12 +465,13 @@ func (s *TransferService) storedBotDocument(chatID int64, messageID int) (stored
 	return document, err
 }
 
-func (s *TransferService) claimTransfer(chatID int64, messageID int, userID int64) (bool, error) {
+func (s *TransferService) claimTransfer(chatID int64, messageID int, userID int64, fileUniqueID string) (bool, error) {
 	result, err := s.db.Exec(
-		"INSERT OR IGNORE INTO document_transfer(chat_id, message_id, user_id) VALUES(?, ?, ?)",
+		"INSERT OR IGNORE INTO document_transfer(chat_id, message_id, user_id, file_unique_id) VALUES(?, ?, ?, ?)",
 		chatID,
 		messageID,
 		userID,
+		fileUniqueID,
 	)
 	if err != nil {
 		return false, err
