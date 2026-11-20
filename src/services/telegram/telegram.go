@@ -319,9 +319,7 @@ func (s *TransferService) rememberBotDocument(ctx context.Context, message *mode
 	}
 	log.Printf("bot document stored chat_id=%d message_id=%d source_bot_id=%d extension=%q", message.Chat.ID, message.ID, message.From.ID, strings.ToLower(filepath.Ext(message.Document.FileName)))
 
-	if s.setStatusReaction(ctx, message.Chat.ID, message.ID, transferReactionEmoji) {
-		log.Printf("trigger reaction added chat_id=%d message_id=%d", message.Chat.ID, message.ID)
-	}
+	log.Printf("bot document ready for user reaction chat_id=%d message_id=%d", message.Chat.ID, message.ID)
 }
 
 func (s *TransferService) handleReaction(ctx context.Context, reaction *models.MessageReactionUpdated) {
