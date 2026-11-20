@@ -337,11 +337,13 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 	if errors.Is(err, sql.ErrNoRows) {
 		log.Printf("reaction has no stored bot document chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
 		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
+		s.sendPrivateStatus(ctx, reaction.User.ID, "❌ Не удалось отправить файл: бот не получил исходное сообщение. Попросите второго бота прислать новый файл и поставьте на нём 👍.")
 		return
 	}
 	if err != nil {
 		log.Printf("load bot document %d/%d: %v", reaction.Chat.ID, reaction.MessageID, err)
 		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
+		s.sendPrivateStatus(ctx, reaction.User.ID, "❌ Не удалось прочитать сведения о файле. Попробуйте убрать и снова поставить 👍 немного позже.")
 		return
 	}
 
@@ -349,11 +351,13 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 	if errors.Is(err, sql.ErrNoRows) {
 		log.Printf("reacting user has no registered email user_id=%d", reaction.User.ID)
 		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
+		s.sendPrivateStatus(ctx, reaction.User.ID, "❌ Email не зарегистрирован. Отправьте мне в личном чате команду /email адрес@example.com, затем повторите 👍 в группе.")
 		return
 	}
 	if err != nil {
 		log.Printf("load email for reacting user %d: %v", reaction.User.ID, err)
 		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
+		s.sendPrivateStatus(ctx, reaction.User.ID, "❌ Не удалось прочитать зарегистрированный Email. Попробуйте повторить отправку немного позже.")
 		return
 	}
 
@@ -361,6 +365,7 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 	if err != nil {
 		log.Printf("claim document transfer: %v", err)
 		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
+		s.sendPrivateStatus(ctx, reaction.User.ID, "❌ Не удалось запустить отправку. Попробуйте убрать и снова поставить 👍 немного позже.")
 		return
 	}
 	if !claimed {
@@ -380,10 +385,13 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 		s.releaseTransfer(reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
 		log.Printf("send reacted document to email: %v", err)
 		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
+		s.sendPrivateStatus(ctx, reaction.User.ID, "❌ Не удалось отправить файл на зарегистрированный Email. Уберите и снова поставьте 👍, чтобы повторить попытку.")
 		return
 	}
 
-	s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, successReactionEmoji)
+	if !s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, successReactionEmoji) {
+		s.sendPrivateStatus(ctx, reaction.User.ID, "✅ Файл отправлен на зарегистрированный Email, но обновить статусную реакцию в группе не удалось.")
+	}
 	log.Printf("reaction transfer completed chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
 }
 
@@ -403,6 +411,15 @@ func (s *TransferService) setStatusReaction(ctx context.Context, chatID int64, m
 		return false
 	}
 	return true
+}
+
+func (s *TransferService) sendPrivateStatus(ctx context.Context, userID int64, text string) {
+	if _, err := s.Bot.SendMessage(ctx, &telegrambot.SendMessageParams{
+		ChatID: userID,
+		Text:   text,
+	}); err != nil {
+		log.Printf("send private transfer status user_id=%d: %v", userID, err)
+	}
 }
 
 func transferReactionAdded(oldReactions, newReactions []models.ReactionType) bool {
