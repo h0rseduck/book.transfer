@@ -20,7 +20,12 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
-const transferReactionEmoji = "👍"
+const (
+	transferReactionEmoji   = "👍"
+	processingReactionEmoji = "👀"
+	successReactionEmoji    = "✅"
+	failureReactionEmoji    = "❌"
+)
 
 type TransferService struct {
 	Bot             *telegrambot.Bot
@@ -314,19 +319,7 @@ func (s *TransferService) rememberBotDocument(ctx context.Context, message *mode
 	}
 	log.Printf("bot document stored chat_id=%d message_id=%d source_bot_id=%d extension=%q", message.Chat.ID, message.ID, message.From.ID, strings.ToLower(filepath.Ext(message.Document.FileName)))
 
-	_, err = s.Bot.SetMessageReaction(ctx, &telegrambot.SetMessageReactionParams{
-		ChatID:    message.Chat.ID,
-		MessageID: message.ID,
-		Reaction: []models.ReactionType{{
-			Type: models.ReactionTypeTypeEmoji,
-			ReactionTypeEmoji: &models.ReactionTypeEmoji{
-				Emoji: transferReactionEmoji,
-			},
-		}},
-	})
-	if err != nil {
-		log.Printf("add %s reaction to bot document %d/%d: %v", transferReactionEmoji, message.Chat.ID, message.ID, err)
-	} else {
+	if s.setStatusReaction(ctx, message.Chat.ID, message.ID, transferReactionEmoji) {
 		log.Printf("trigger reaction added chat_id=%d message_id=%d", message.Chat.ID, message.ID)
 	}
 }
@@ -343,30 +336,31 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 	document, err := s.storedBotDocument(reaction.Chat.ID, reaction.MessageID)
 	if errors.Is(err, sql.ErrNoRows) {
 		log.Printf("reaction has no stored bot document chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
-		text := userLabel(reaction.User) + ": не могу отправить файл — исходное сообщение другого бота не было получено. Проверьте Bot-to-Bot Communication Mode, права администратора и Group Privacy."
-		s.sendReply(ctx, reaction.Chat.ID, reaction.MessageID, text, "")
+		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
 		return
 	}
 	if err != nil {
 		log.Printf("load bot document %d/%d: %v", reaction.Chat.ID, reaction.MessageID, err)
+		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
 		return
 	}
 
 	emailAddress, err := s.userEmail(reaction.User.ID)
 	if errors.Is(err, sql.ErrNoRows) {
 		log.Printf("reacting user has no registered email user_id=%d", reaction.User.ID)
-		text := userLabel(reaction.User) + ", сначала зарегистрируйте Email командой /email в личном чате с ботом."
-		s.sendReply(ctx, reaction.Chat.ID, reaction.MessageID, text, "")
+		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
 		return
 	}
 	if err != nil {
 		log.Printf("load email for reacting user %d: %v", reaction.User.ID, err)
+		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
 		return
 	}
 
 	claimed, err := s.claimTransfer(reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
 	if err != nil {
 		log.Printf("claim document transfer: %v", err)
+		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
 		return
 	}
 	if !claimed {
@@ -374,31 +368,41 @@ func (s *TransferService) handleReaction(ctx context.Context, reaction *models.M
 		return
 	}
 	log.Printf("reaction transfer started chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
-	statusMessageID := s.sendReply(
-		ctx,
-		reaction.Chat.ID,
-		reaction.MessageID,
-		userLabel(reaction.User)+": ⏳ отправляю файл на зарегистрированный Email…",
-		"",
-	)
+	s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, processingReactionEmoji)
 
 	telegramDocument := &models.Document{
 		FileID:       document.FileID,
 		FileUniqueID: document.FileUniqueID,
 		FileName:     document.FileName,
 	}
-	filename, err := s.sendDocumentToEmail(ctx, telegramDocument, document.Caption, emailAddress)
+	_, err = s.sendDocumentToEmail(ctx, telegramDocument, document.Caption, emailAddress)
 	if err != nil {
 		s.releaseTransfer(reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
 		log.Printf("send reacted document to email: %v", err)
-		text := userLabel(reaction.User) + ": не удалось отправить файл. Уберите и снова поставьте реакцию " + transferReactionEmoji + ", чтобы повторить."
-		s.updateStatus(ctx, reaction.Chat.ID, reaction.MessageID, statusMessageID, text)
+		s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, failureReactionEmoji)
 		return
 	}
 
-	text := userLabel(reaction.User) + ": ✅ файл '" + filename + "' успешно отправлен на зарегистрированный Email."
-	s.updateStatus(ctx, reaction.Chat.ID, reaction.MessageID, statusMessageID, text)
+	s.setStatusReaction(ctx, reaction.Chat.ID, reaction.MessageID, successReactionEmoji)
 	log.Printf("reaction transfer completed chat_id=%d message_id=%d user_id=%d", reaction.Chat.ID, reaction.MessageID, reaction.User.ID)
+}
+
+func (s *TransferService) setStatusReaction(ctx context.Context, chatID int64, messageID int, emoji string) bool {
+	_, err := s.Bot.SetMessageReaction(ctx, &telegrambot.SetMessageReactionParams{
+		ChatID:    chatID,
+		MessageID: messageID,
+		Reaction: []models.ReactionType{{
+			Type: models.ReactionTypeTypeEmoji,
+			ReactionTypeEmoji: &models.ReactionTypeEmoji{
+				Emoji: emoji,
+			},
+		}},
+	})
+	if err != nil {
+		log.Printf("set Telegram status reaction emoji=%s chat_id=%d message_id=%d: %v", emoji, chatID, messageID, err)
+		return false
+	}
+	return true
 }
 
 func transferReactionAdded(oldReactions, newReactions []models.ReactionType) bool {
@@ -557,8 +561,8 @@ func (s *TransferService) downloadFile(ctx context.Context, link, destination st
 	return nil
 }
 
-func (s *TransferService) sendReply(ctx context.Context, chatID int64, messageID int, text string, parseMode models.ParseMode) int {
-	message, err := s.Bot.SendMessage(ctx, &telegrambot.SendMessageParams{
+func (s *TransferService) sendReply(ctx context.Context, chatID int64, messageID int, text string, parseMode models.ParseMode) {
+	_, err := s.Bot.SendMessage(ctx, &telegrambot.SendMessageParams{
 		ChatID:    chatID,
 		Text:      text,
 		ParseMode: parseMode,
@@ -569,32 +573,5 @@ func (s *TransferService) sendReply(ctx context.Context, chatID int64, messageID
 	})
 	if err != nil {
 		log.Printf("send Telegram reply: %v", err)
-		return 0
 	}
-	return message.ID
-}
-
-func (s *TransferService) updateStatus(ctx context.Context, chatID int64, replyToMessageID, statusMessageID int, text string) {
-	if statusMessageID != 0 {
-		if _, err := s.Bot.EditMessageText(ctx, &telegrambot.EditMessageTextParams{
-			ChatID:    chatID,
-			MessageID: statusMessageID,
-			Text:      text,
-		}); err == nil {
-			return
-		} else {
-			log.Printf("edit Telegram transfer status: %v", err)
-		}
-	}
-	s.sendReply(ctx, chatID, replyToMessageID, text, "")
-}
-
-func userLabel(user *models.User) string {
-	if user.Username != "" {
-		return "@" + user.Username
-	}
-	if user.FirstName != "" {
-		return user.FirstName
-	}
-	return strconv.FormatInt(user.ID, 10)
 }
