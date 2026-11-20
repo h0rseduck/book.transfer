@@ -14,8 +14,8 @@ COPY . .
 
 RUN go build -o main .
 
-RUN chmod 0777 ./database && \
-    chmod 0777 ./upload
+RUN mkdir -p ./database ./upload && \
+	chmod 0777 ./database ./upload
 
 EXPOSE 3000
 

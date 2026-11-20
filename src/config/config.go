@@ -2,6 +2,7 @@ package config
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -16,7 +17,7 @@ const ServiceDataRetention = 30 * 24 * time.Hour
 
 func LoadEnv() {
 	errorENV := godotenv.Load()
-	if errorENV != nil {
+	if errorENV != nil && !errors.Is(errorENV, os.ErrNotExist) {
 		panic("Failed to load env file")
 	}
 }

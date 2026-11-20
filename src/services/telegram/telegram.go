@@ -458,18 +458,23 @@ func (s *TransferService) sendDocumentToEmail(ctx context.Context, document *mod
 	if err != nil {
 		return filename, fmt.Errorf("get working directory: %w", err)
 	}
-	directory := filepath.Join(workingDirectory, "upload", document.FileUniqueID)
-	if err := os.MkdirAll(directory, os.ModePerm); err != nil {
+	uploadDirectory := filepath.Join(workingDirectory, "upload")
+	if err := os.MkdirAll(uploadDirectory, os.ModePerm); err != nil {
 		return filename, fmt.Errorf("create upload directory: %w", err)
 	}
+	directory, err := os.MkdirTemp(uploadDirectory, "transfer-")
+	if err != nil {
+		return filename, fmt.Errorf("create temporary transfer directory: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(directory); err != nil {
+			log.Printf("remove temporary transfer directory: %v", err)
+		}
+	}()
 
 	localFilepath := filepath.Join(directory, filename)
-	if _, err := os.Stat(localFilepath); errors.Is(err, os.ErrNotExist) {
-		if err := s.downloadFile(ctx, s.Bot.FileDownloadLink(file), localFilepath); err != nil {
-			return filename, err
-		}
-	} else if err != nil {
-		return filename, fmt.Errorf("inspect downloaded file: %w", err)
+	if err := s.downloadFile(ctx, s.Bot.FileDownloadLink(file), localFilepath); err != nil {
+		return filename, err
 	}
 
 	subject := ""
